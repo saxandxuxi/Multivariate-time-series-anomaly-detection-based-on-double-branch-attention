@@ -5,6 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from ray.experimental import channel
+
+from .DynamicReconHead import DynamicReconHead
+from .GCN_representation import GCN
 from .Mahalanobis_mask import Mahalanobis_mask, PyramidMahalanobisMask, MultiDistanceChannelClustering
 from .TCM import Linear_extractor_cluster
 from .attn import DAC_structure, AttentionLayer
@@ -12,45 +16,10 @@ from .compute_ppr import compute_ppr
 from .embed import DataEmbedding, TokenEmbedding
 from .RevIN import RevIN
 
-
-# def order_shuffle(x, size=None):
-#     """对通道维度进行随机混洗（通道维度在最后一维）"""
-#     if size is None:
-#         size = x.shape[-1]  # 通道维度在最后一维（B, L, M）
-#     shuffled_indices = torch.randperm(size, device=x.device)
-#     return x[..., shuffled_indices]  # 混洗最后一维（通道维度）
-
-def order_shuffle(tensor, size=2, dim=1):
-    """将指定维度的特征向量均分为两部分并交换顺序"""
-    target_size = tensor.shape[dim]
-    half_n = target_size // size
-    part1 = tensor.narrow(dim, half_n, target_size - half_n)  # 后半部分
-    part2 = tensor.narrow(dim, 0, half_n)                     # 前半部分
-    return torch.cat([part1, part2], dim=dim)  # 拼接：后半部分+前半部分
-
-
-class Encoder(nn.Module):
-    def __init__(self, attn_layers, norm_layer=None):
-        super(Encoder, self).__init__()
-        self.attn_layers = nn.ModuleList(attn_layers)
-        self.norm = norm_layer
-
-    def forward(self, x_patch_size, x_patch_num, x_ori, patch_index,channel_mask):
-        series_list = []
-        prior_list = []
-        series_rec_list = []
-        for attn_layer in self.attn_layers:
-            series, prior,series_rec = attn_layer(x_patch_size, x_patch_num, x_ori, patch_index, attn_mask=channel_mask)
-            series_list.append(series)
-            prior_list.append(prior)
-            series_rec_list.append(series_rec)
-        return series_list, prior_list, series_rec_list
-
-
-class DCdetector(nn.Module):
+class GCdetector(nn.Module):
     def __init__(self, win_size, enc_in, c_out, n_heads=1, d_model=256, e_layers=3, patch_size=[3, 5, 7], channel=55,
                  d_ff=512, dropout=0.0, activation='gelu', output_attention=True,num_experts = 3,k=2):
-        super(DCdetector, self).__init__()
+        super(GCdetector, self).__init__()
         self.output_attention = output_attention
         self.patch_size = patch_size
         self.channel = channel
@@ -83,15 +52,7 @@ class DCdetector(nn.Module):
         self.cross_channel_ffn =Mahalanobis_mask(win_size)
 
         # Dual Attention Encoder
-        self.encoder = Encoder(
-            [
-                AttentionLayer(
-                    DAC_structure(win_size, patch_size, channel, True, attention_dropout=dropout,
-                                  output_attention=output_attention),
-                    d_model, patch_size, channel, n_heads, win_size) for l in range(e_layers)
-            ],
-            norm_layer=torch.nn.LayerNorm(d_model)
-        )
+        self.encoder = GCN(in_ft=d_model,out_ft=d_model)
 
         self.projection = nn.Linear(d_model, c_out, bias=True)
 
@@ -103,14 +64,9 @@ class DCdetector(nn.Module):
         revin_layer = RevIN(num_features=M)
         # Instance Normalization Operation
         x = revin_layer(x, 'norm')
-
-
         x_channel = x.permute(0, 2, 1)
         channel_mask = self.cross_channel_ffn(x_channel)#(bs,1,22,22)
-
-        x_embed = x_channel.reshape(B*M, L, 1)
-        x_ori = self.embedding_window_size(x_embed)#(1408,70,256)
-
+        self.recon_head = DynamicReconHead()
         # 补丁间的x_patch_size:(B,patch_num,256) 补丁内的x_patch_num:(B,patch_size,256)
         # Mutil-scale Patching Operation
         for patch_index, patchsize in enumerate(self.patch_size):
@@ -121,8 +77,14 @@ class DCdetector(nn.Module):
             x_patch_size = self.embedding_patch_size[patch_index](x_patch_size)#Batch*channel n d_model
             x_patch_num = rearrange(x_patch_num, 'b m (p n) -> (b m) p n', p=patchsize)#Batch*channel p n
             x_patch_num = self.embedding_patch_num[patch_index](x_patch_num)#Batch*channel p d_model
-            series, prior,patch_wise_recon= self.encoder(x_patch_size, x_patch_num, x_ori, patch_index,channel_mask)  # [B,1,L,L]
-            series_patch_mean.append(series), prior_patch_mean.append(prior)
+            # (B,M,3,256) ,(B, M, num_layers*out_ft))
+            n_series,g_series = self.encoder(x_patch_num,channel_mask)
+            n_prior,g_prior = self.prior_centers(x_patch_size,channel_mask)
+            #patch-wise recon
+            patch_wise_recon = self.recon_head(n_series,self.win_size)
+            # upsample
+
+            series_patch_mean.append(g_series), prior_patch_mean.append(g_prior)
             series_rec_mean.append(patch_wise_recon)
 
         series_patch_mean = list(_flatten(series_patch_mean))  ##[B,1,L,L]
@@ -158,5 +120,3 @@ class DCdetector(nn.Module):
             return series_patch_mean, prior_patch_mean, series_features, prior_features, self.series_centers, self.prior_centers,series_rec_mean
         else:
             return None
-        
-

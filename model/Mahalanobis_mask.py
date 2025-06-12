@@ -7,9 +7,9 @@ from torch.nn.functional import gumbel_softmax
 import torch.fft
 from einops import rearrange
 from torch.distributions.gumbel import Gumbel
-from scipy.ndimage import gaussian_filter1d  # 需安装scipy，用于DTW平滑
-from ot import sinkhorn  # 需安装pot库，用于Wasserstein距离
-from torch.nn.parameter import Parameter
+
+from model.compute_ppr import compute_ppr
+
 
 class Mahalanobis_mask(nn.Module):
     def __init__(self, input_size):
@@ -70,9 +70,9 @@ class Mahalanobis_mask(nn.Module):
 
         # bernoulli中两个通道有关系的概率
         sample = self.bernoulli_gumbel_rsample(p)#CCM的最终输出（32,7,7）
-
+        sample = compute_ppr(sample)
         mask = sample.unsqueeze(1)#（32，1,7,7）
-        cnt = torch.sum(mask, dim=-1)
+
         return mask
 
 
@@ -171,7 +171,7 @@ class PyramidMahalanobisMask(nn.Module):
 class MultiDistanceChannelClustering(nn.Module):
     """支持多种距离度量的通道聚类模块，可替代原有的马氏距离实现"""
 
-    def __init__(self, input_size, distance_type='rbf', alpha=0.5, sigma=1.0,
+    def __init__(self, input_size, distance_type='rbf', alpha=1.5, sigma=1.5,
                  dtw_window=3, num_bands=1, channel_count=None):
         """
         参数:
@@ -353,12 +353,12 @@ class MultiDistanceChannelClustering(nn.Module):
 if __name__ == "__main__":
     # 设置随机种子以便结果可复现
     torch.manual_seed(42)
-    x= torch.randn(64,22,70).to('cuda:0')
-    # model1 = Mahalanobis_mask(70)
+    x= torch.randn(64,22,70)
+    model1 = Mahalanobis_mask(70)
     # model2 = PyramidMahalanobisMask(70).to('cuda:0')
-    model3 = MultiDistanceChannelClustering(70).to('cuda:0')
-    # y = model1(x)
+    # model3 = MultiDistanceChannelClustering(70).to('cuda:0')
+    y = model1(x)
     # y2 = model2(x)
-    y3 = model3(x)
-    print(y3.shape)#[64,1,22,22]
-    print(y3)
+    # y3 = model3(x)
+    print(y.shape)#[64,1,22,22]
+    print(y)

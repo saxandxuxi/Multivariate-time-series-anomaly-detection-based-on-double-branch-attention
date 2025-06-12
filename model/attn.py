@@ -7,11 +7,12 @@ from math import sqrt
 import os
 from einops import rearrange, reduce, repeat
 
-
+from model.DynamicReconHead import DynamicReconHead
+from model.GCN_representation import GCN
 
 
 class DAC_structure(nn.Module):
-    def __init__(self, win_size, patch_size, channel, mask_flag=True, scale=None, attention_dropout=0.05, output_attention=False):
+    def __init__(self, win_size, patch_size, channel, mask_flag=True, scale=None, attention_dropout=0.05, output_attention=False,d_model = 256):
         super(DAC_structure, self).__init__()
         self.scale = scale
         self.mask_flag = mask_flag
@@ -20,6 +21,9 @@ class DAC_structure(nn.Module):
         self.window_size = win_size
         self.patch_size = patch_size
         self.channel = channel
+        self.d_model = d_model
+        self.patch_wise_recon_head = DynamicReconHead()
+        self.gcn = GCN(num_layers=1)
 
     def forward(self, queries_patch_size, queries_patch_num, keys_patch_size, keys_patch_num, values, patch_index,
                 attn_mask):
@@ -38,7 +42,9 @@ class DAC_structure(nn.Module):
             # 应用掩码（沿通道维度进行矩阵乘法）
             scores_patch_size = (scores_expanded * mask_expanded).sum(dim=3)  # [B, C, PatchNum, PatchNum]
 
+
         attn_patch_size = scale_patch_size * scores_patch_size
+        attn_patch_size = self.gcn(attn_patch_size,attn_mask,out_ft = PatchNum )
         series_patch_size = self.dropout(torch.softmax(attn_patch_size, dim=-1))  # bs, channel, patch_num, patch_num
 
         # In-patch Representation
@@ -47,14 +53,21 @@ class DAC_structure(nn.Module):
         scale_patch_num = self.scale or 1. / torch.sqrt(torch.tensor(D, dtype=torch.float32))
         scores_patch_num = torch.einsum("bnld,bnmd->bnlm", queries_patch_num,
                                         keys_patch_num)  # bs, channel, patch_size, patch_size
-        # 应用通道掩码（修正：先应用掩码，再缩放，避免维度扩展）
-        if attn_mask is not None:
+        # 应用通道掩码
+        if self.mask_flag:
             mask_expanded = attn_mask.squeeze(1).unsqueeze(2).unsqueeze(-1)  # [B, C, 1, C, 1]
             scores_expanded = scores_patch_num.unsqueeze(3)  # [B, C, PatchSize, 1, PatchSize]
             scores_patch_num = (scores_expanded * mask_expanded).sum(dim=3)  # [B, C, PatchSize, PatchSize]
 
         attn_patch_num = scale_patch_num * scores_patch_num
+        attn_patch_num = self.gcn(attn_patch_num,attn_mask,out_ft=PatchSize)
         series_patch_num = self.dropout(torch.softmax(attn_patch_num, dim=-1))  # bs, channel, patch_size, patch_size
+
+        # 补丁间重建（保留通道维度）
+        bs, ch, pn, _ = series_patch_size.shape
+        patch_wise_flat = series_patch_size.reshape(bs, ch, -1)  # (bs, channel, patch_num*patch_num)
+        patch_wise_recon = self.patch_wise_recon_head(patch_wise_flat, self.window_size)  # (bs, channel, pn)
+        patch_wise_recon = patch_wise_recon.permute(0, 2, 1)
 
         # 通道间平均
         series_patch_size = series_patch_size.mean(dim=1, keepdim=True)  # bs, 1, patch_num, patch_num
@@ -68,7 +81,7 @@ class DAC_structure(nn.Module):
                                          align_corners=False)
 
         if self.output_attention:
-            return series_patch_size, series_patch_num
+            return series_patch_size, series_patch_num,patch_wise_recon
         else:
             return None
 
@@ -114,14 +127,14 @@ class AttentionLayer(nn.Module):
         B, L, d_model = x_ori.shape#(1408,70,256)
         values = self.value_projection(x_ori).view(BS, N, L, -1)
         
-        series, prior = self.inner_attention(
+        series, prior,patch_wise_recon = self.inner_attention(
             queries_patch_size, queries_patch_num,
             keys_patch_size, keys_patch_num,
             values, patch_index,
             attn_mask
         )
         
-        return series, prior
+        return series, prior,patch_wise_recon
 
   # # 处理series_patch_size
   #       batch_times_heads, heads, n, n = series_patch_size.shape

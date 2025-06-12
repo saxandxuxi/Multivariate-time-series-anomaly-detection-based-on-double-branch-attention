@@ -17,6 +17,9 @@ from data_factory.data_loader import get_loader_segment
 from einops import rearrange
 from metrics.metrics import *
 import warnings
+
+from utils.visualize_anomaly_comparison import save_energy_metrics
+
 warnings.filterwarnings('ignore')
 
 def my_kl_loss(p, q):
@@ -97,18 +100,6 @@ class Solver(object):
         self.build_model()
 
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        # 新增：初始化对比学习相关参数
-        self.use_contrastive = config.get('use_contrastive', True)
-        # self.contrastive_weight = config.get('contrastive_weight', 0.15)#EV24:0.15 EV47:0.15
-        self.temperature = config.get('temperature', 0.25)
-
-        # 新增：初始化投影头（使用正确的特征维度 `win_size`）
-        if self.use_contrastive:
-            feature_dim = self.win_size  # 直接使用 `win_size` 作为特征维度
-            self.projection = nn.Sequential(
-                nn.Linear(feature_dim, feature_dim // 4),
-                nn.GELU()
-            ).to(self.device)
 
         if self.loss_fuc == 'MAE':
             self.criterion = nn.L1Loss()
@@ -146,7 +137,8 @@ class Solver(object):
             prior_loss += torch.mean(kl_n1 + kl_n2)  # 双向求和，补丁间
         series_loss = series_loss / len(prior)
         prior_loss = prior_loss / len(prior)
-        prior_loss = prior_loss * self.contrastive_weight
+        prior_loss = prior_loss * self.patchnum_weight
+        series_loss = series_loss * self.patchsize_weight
         return series_loss, prior_loss
 
     def compute_center_loss(self, series_features, prior_features):
@@ -166,66 +158,15 @@ class Solver(object):
 
         return total_loss / len(self.series_centers)  # [B, L]
 
-    def _compute_contrastive_loss(self, series, prior):
-        """计算对比学习损失，保持[B,L]维度输出"""
-        batch_size = series[0].size(0)
-        win_size = series[0].size(3)  # 假设特征维度由 win_size 决定
-        seq_len = series[0].size(2)  # 序列长度 L
-        contrastive_loss = torch.zeros(batch_size, seq_len, device=self.device)
-        num_scales = len(self.patch_size)
-        num_layers = len(series) // num_scales
+    def compute_mse_loss(self, series_rec_mean,input):
+        # 计算补丁间的重建损失
+        batch_size,seq_len,_ = series_rec_mean[0].shape
+        series_mseloss = torch.zeros(batch_size, seq_len, device=series_rec_mean[0].device)
+        for u in range(len(series_rec_mean)):
+            series_mseloss+=self.criterion(series_rec_mean[u], input)
+        series_mse_loss = series_mseloss/len(series_rec_mean)
 
-        def feature_perturbation(x):
-            """针对特征表示的扰动函数"""
-            mask = torch.rand_like(x) > 0.3
-            masked = x * mask.float()
-            if seq_len > 1:
-                shift_val = torch.randint(-seq_len // 8, seq_len // 8, (1,), device=x.device)[0]
-                shift = int(shift_val)
-                if shift == 0:
-                    shift = 1 if torch.rand(1) > 0.5 else -1
-                shifted = torch.roll(x, shifts=shift, dims=2)
-            else:
-                shifted = x
-            return 0.5 * masked + 0.5 * shifted
-
-        for scale_idx in range(num_scales):
-            for layer_idx in range(num_layers):
-                u = scale_idx * num_layers + layer_idx
-                s = series[u]  # [B, 1, L, L]
-                p = prior[u]  # [B, 1, L, L]
-
-                s_neg = feature_perturbation(s)
-                p_neg = feature_perturbation(p)
-
-                # 修正展平方式，将 [B, 1, L, L] 转为 [B, L, L]
-                s_flat = s.reshape(batch_size, seq_len, seq_len)  # [B, L, L]
-                p_flat = p.reshape(batch_size, seq_len, seq_len)
-                s_neg_flat = s_neg.reshape(batch_size, seq_len, seq_len)
-                p_neg_flat = p_neg.reshape(batch_size, seq_len, seq_len)
-
-                s_proj = torch.stack([self.projection(s_flat[:, i, :]) for i in range(seq_len)], dim=1)
-                p_proj = torch.stack([self.projection(p_flat[:, i, :]) for i in range(seq_len)], dim=1)
-                s_neg_proj = torch.stack([self.projection(s_neg_flat[:, i, :]) for i in range(seq_len)], dim=1)
-                p_neg_proj = torch.stack([self.projection(p_neg_flat[:, i, :]) for i in range(seq_len)], dim=1)
-
-                s_norm = F.normalize(s_proj, p=2, dim=2)
-                p_norm = F.normalize(p_proj, p=2, dim=2)
-                s_neg_norm = F.normalize(s_neg_proj, p=2, dim=2)
-                p_neg_norm = F.normalize(p_neg_proj, p=2, dim=2)
-
-                pos_sim = torch.sum(s_norm * p_norm, dim=2) / self.temperature  # [B,L]
-                neg_sim1 = torch.sum(s_norm * p_neg_norm, dim=2) / self.temperature  # [B,L]
-                neg_sim2 = torch.sum(s_neg_norm * p_norm, dim=2) / self.temperature  # [B,L]
-
-                time_loss = -torch.log(
-                    torch.exp(pos_sim) /
-                    (torch.exp(pos_sim) + torch.exp(neg_sim1) + torch.exp(neg_sim2) + 1e-8)
-                )  # [B,L]
-
-                contrastive_loss += time_loss  # 显式聚合为标量
-
-        return contrastive_loss / (num_scales * num_layers)
+        return series_mse_loss
 
     def vali(self, vali_loader):
         self.model.eval()
@@ -234,11 +175,18 @@ class Solver(object):
         for i, (input_data, _) in enumerate(vali_loader):
             input = input_data.float().to(self.device)
             # series, prior = self.model(input)
-            series, prior,series_features, prior_features, self.series_centers,self.prior_centers = self.model(input)
+            series, prior,series_features, prior_features, self.series_centers,self.prior_centers,series_rec_mean = self.model(input)
+
             series_loss, prior_loss = self._compute_KL_losses(series, prior)
+
+
+            series_mse_loss= self.compute_mse_loss(series_rec_mean, input)
+            series_mse_loss = torch.mean(series_mse_loss)
+
             center_loss = self.compute_center_loss(series_features, prior_features)
             center_loss = torch.mean(center_loss)
-            loss = abs(prior_loss - series_loss) + center_loss
+
+            loss = self.kl_loss*abs(prior_loss - series_loss)+center_loss+self.rec_loss*series_mse_loss
             loss_1.append(loss.item())
             # loss_1.append((prior_loss - series_loss).item())
         return np.average(loss_1), np.average(loss_2)
@@ -249,7 +197,7 @@ class Solver(object):
         if not os.path.exists(path):
             os.makedirs(path)
         early_stopping = EarlyStopping(patience=5, verbose=True, dataset_name=self.data_path)
-        train_steps = len(self.train_loader)
+
 
         # # 定义两个可学习的权重参数
         # series_weight = nn.Parameter(torch.tensor(1.0, requires_grad=True))
@@ -269,11 +217,16 @@ class Solver(object):
                 # series, prior = self.model(input)
                 # series_loss, prior_loss = self._compute_KL_losses(series, prior)
                 # loss = prior_loss - series_loss
-                series, prior, series_features, prior_features, self.series_centers, self.prior_centers = self.model(input)
+                series, prior,series_features, prior_features, self.series_centers,self.prior_centers,series_rec_mean= self.model(input)
                 series_loss, prior_loss = self._compute_KL_losses(series, prior)
+
+                series_mse_loss = self.compute_mse_loss(series_rec_mean, input)
+                series_mse_loss = torch.mean(series_mse_loss)
+
                 center_loss = self.compute_center_loss(series_features, prior_features)
                 center_loss = torch.mean(center_loss)
-                loss = abs(prior_loss - series_loss) + center_loss
+
+                loss = self.kl_loss*abs(prior_loss - series_loss)+center_loss+self.rec_loss*series_mse_loss
                 if (i + 1) % 100 == 0:
                     # speed = (time.time() - time_now) / iter_count
                     # left_time = speed * ((self.num_epochs - epoch) * train_steps - i)
@@ -302,7 +255,7 @@ class Solver(object):
         attens_energy = []
         for i, (input_data, labels) in enumerate(data_loader):
             input = input_data.float().to(self.device)
-            series, prior,series_features, prior_features,_,_ = self.model(input)
+            series, prior,series_features, prior_features,_,_,series_rec_mean = self.model(input)
             series_loss = 0.0
             prior_loss = 0.0
             for u in range(len(prior)):
@@ -313,8 +266,10 @@ class Solver(object):
                 series_loss += my_kl_loss(series[u], n_normalized.detach()) * temperature
                 prior_loss += my_kl_loss(prior[u], p_normalized.detach()) * temperature
             center_loss = self.compute_center_loss(series_features, prior_features)
+            series_mse_loss = self.compute_mse_loss(series_rec_mean, input)
             # metric = torch.softmax((-series_loss - prior_loss), dim=-1)
-            metric = torch.softmax((-series_loss - prior_loss-center_loss), dim=-1)
+            kl_loss = -self.patchnum_weight*series_loss - self.patchsize_weight*prior_loss
+            metric = torch.softmax((kl_loss-center_loss-self.rec_loss*series_mse_loss), dim=-1)
             cri = metric.detach().cpu().numpy()
             attens_energy.append(cri)
         return np.concatenate(attens_energy, axis=0).reshape(-1)
@@ -325,7 +280,7 @@ class Solver(object):
         labels_list = []
         for i, (input_data, labels) in enumerate(data_loader):
             input = input_data.float().to(self.device)
-            series, prior,series_features, prior_features,_,_= self.model(input)
+            series, prior,series_features, prior_features,_,_,series_rec_mean= self.model(input)
             series_loss = 0.0
             prior_loss = 0.0
             for u in range(len(prior)):
@@ -337,7 +292,9 @@ class Solver(object):
                 prior_loss += my_kl_loss(prior[u], p_normalized.detach()) * temperature
 
             center_loss = self.compute_center_loss(series_features, prior_features)
-            metric = torch.softmax((-series_loss - prior_loss - center_loss), dim=-1)
+            series_mse_loss = self.compute_mse_loss(series_rec_mean, input)
+            kl_loss = -self.patchnum_weight*series_loss - self.patchsize_weight*prior_loss
+            metric = torch.softmax((kl_loss - center_loss - self.rec_loss * series_mse_loss), dim=-1)
             # metric = torch.softmax((-series_loss - prior_loss), dim=-1)
             cri = metric.detach().cpu().numpy()
             attens_energy.append(cri)
@@ -363,7 +320,7 @@ class Solver(object):
         train_energy = self._compute_attens_energy(self.train_loader, temperature)
         # (2) find the threshold
         test_energy = self._compute_attens_energy(self.thre_loader, temperature)
-        combined_energy = np.concatenate([train_energy, test_energy], axis=0)
+        combined_energy = np.concatenate([train_energy, test_energy], axis=0)#一维
         print('==============================测试阶段训练完成============================')
         # thresh = np.percentile(combined_energy, 100 - self.anormly_ratio)
         thresh = set_global_threshold(combined_energy,sigma=self.sigma)
@@ -410,7 +367,8 @@ class Solver(object):
         print(
             "Accuracy : {:0.4f}, Precision : {:0.4f}, Recall : {:0.4f}, F-score : {:0.4f} ".format(accuracy, precision,
                                                                                                    recall, f_score))
-
+        save_path=save_energy_metrics(self.data_path, combined_energy,test_energy, pred, gt, self.sigma)
+        print(f"数据保存到 {save_path}")
 
         return accuracy, precision, recall, f_score
 

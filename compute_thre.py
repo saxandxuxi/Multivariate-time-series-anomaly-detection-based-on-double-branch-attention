@@ -84,7 +84,7 @@ def histogram_threshold(combined_energy, bins=50):
     return np.percentile(scores, 95)
 
 
-def sliding_window_threshold(combined_energy, window_size=5, sigma=2.0):
+def sliding_window_threshold(combined_energy, window_size=10, sigma=2.0):
     """简化的滑动窗口阈值计算（兼容PyTorch和NumPy）"""
     import torch
 
