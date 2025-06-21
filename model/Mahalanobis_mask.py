@@ -12,13 +12,12 @@ from model.compute_ppr import compute_ppr
 
 
 class Mahalanobis_mask(nn.Module):
-    def __init__(self, input_size):
+    def __init__(self):
         super(Mahalanobis_mask, self).__init__()
-        frequency_size = input_size // 2 + 1
-        self.A = nn.Parameter(torch.randn(frequency_size, frequency_size), requires_grad=True)#初始化可学习的马氏距离矩阵A（257,257），512的一半
-
+        self.A = None
     #  通道聚类模块（CCM）
     def calculate_prob_distance(self, X):
+
         XF = torch.abs(torch.fft.rfft(X, dim=-1))#实值FFT，取模得到频域幅值
         X1 = XF.unsqueeze(2)#（32,7,1,257）
         X2 = XF.unsqueeze(1)#（32,1,7,257），形状 [B, C, C, D]，通道i与j的频域差异
@@ -65,12 +64,16 @@ class Mahalanobis_mask(nn.Module):
         resample_matrix = rearrange(resample_matrix[..., 0], '(b c d) -> b c d', b=b, c=c, d=d)#[32,7,7]
         return resample_matrix
 
-    def forward(self, X):
+    def forward(self, X, input_size):
+        frequency_size = input_size // 2 + 1
+        # 动态创建或更新可学习矩阵A
+        if self.A is None or self.A.shape[0] != frequency_size:
+            self.A = nn.Parameter(torch.randn(frequency_size, frequency_size), requires_grad=True).to(X.device)
         p = self.calculate_prob_distance(X)#CCM的概率矩阵
-
+        p = compute_ppr(p)
         # bernoulli中两个通道有关系的概率
         sample = self.bernoulli_gumbel_rsample(p)#CCM的最终输出（32,7,7）
-        sample = compute_ppr(sample)
+        # sample = compute_ppr(sample)
         mask = sample.unsqueeze(1)#（32，1,7,7）
 
         return mask

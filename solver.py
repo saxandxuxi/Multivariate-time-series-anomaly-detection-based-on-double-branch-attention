@@ -8,9 +8,10 @@ import os
 import time
 
 from sklearn.metrics import precision_recall_fscore_support
-from torch.optim import Adam
+from torch.optim import Adam, RAdam
 
 from compute_thre import sliding_window_threshold,set_global_threshold
+from model.FEBdectector import FEBdetector
 from utils.utils import *
 from model.DCdetector import DCdetector
 from data_factory.data_loader import get_loader_segment
@@ -65,12 +66,15 @@ class EarlyStopping:
             self.save_checkpoint(val_loss, val_loss2, model, path)
             self.counter = 0
 
-    def save_checkpoint(self, val_loss, val_loss2, model, path):
+    def save_checkpoint(self, val_loss, val_loss2, model, path):#修改增加
         """保存模型权重和中心向量"""
         state_dict = {
             'model_state_dict': model.state_dict(),
-            'series_centers': [center.detach().cpu() for center in model.series_centers],
-            'prior_centers': [center.detach().cpu() for center in model.prior_centers],
+            # 'series_centers': [center.detach().cpu() for center in model.series_centers],
+            # 'prior_centers': [center.detach().cpu() for center in model.prior_centers],
+            # # 'patchnum_weight':patchnum_weight,
+            # 'patchsize_weight':patchsize_weight,
+            # 'rec_weight': rec_weight
             # 可添加其他需要保存的参数
         }
         # torch.save(model.state_dict(), os.path.join(path, str(self.dataset) + '_checkpoint.pth'))
@@ -107,7 +111,7 @@ class Solver(object):
             self.criterion = nn.MSELoss()
 
     def build_model(self):
-        self.model = DCdetector(win_size=self.win_size, enc_in=self.input_c, c_out=self.output_c, n_heads=self.n_heads,
+        self.model = FEBdetector(win_size=self.win_size, enc_in=self.input_c, c_out=self.output_c, n_heads=self.n_heads,
                                 d_model=self.d_model, e_layers=self.e_layers, patch_size=self.patch_size,
                                 channel=self.input_c,dropout=self.dropout)
 
@@ -115,6 +119,41 @@ class Solver(object):
             self.model.cuda()
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)#增加了weight_decay=0.0001
+        # self.optimizer = RAdam(
+        #     self.model.parameters(),
+        #     lr=self.lr
+        # )
+
+    def adjust_ratio(self,w1,w2,w3,L1,L2,L3,ema_beta = 0.8):
+        if torch.is_tensor(w1):
+            w1 = w1.detach().cpu().item()  # 强制转CPU并提取数值
+        if torch.is_tensor(w2):
+            w2 = w2.detach().cpu().item()
+        if torch.is_tensor(w3):
+            w3 = w3.detach().cpu().item()
+
+        if torch.is_tensor(L1):
+            L1 = L1.detach().cpu().item()
+        if torch.is_tensor(L2):
+            L2 = L2.detach().cpu().item()
+        if torch.is_tensor(L3):
+            L3 = L3.detach().cpu().item()\
+
+        total_L = L1 + L2 + L3
+        avg_L = total_L / 3
+        # Step 3: 动态调整权重（与损失值成反比）
+        w1 = ema_beta * w1 + (1 - ema_beta) * (L1 / avg_L)
+        w2 = ema_beta * w2 + (1 - ema_beta) * (L2 / avg_L)
+        w3 = ema_beta * w3 + (1 - ema_beta) * (L3 / avg_L)
+        # w1 = w1 * (L1 / avg_L) if avg_L != 0 else w1
+        # w2 = w2 * (L2 / avg_L) if avg_L != 0 else w2
+        # w3 = w3 * (L3 / avg_L) if avg_L != 0 else w3
+
+        # Step 4: 限制权重范围 [0, 1]（可选，根据需求调整）
+        w1 = max(0.0, min(1.0, w1))
+        w2 = max(0.0, min(1.0, w2))
+        w3 = max(0.0, min(1.0, w3))
+        return w1, w2, w3
 
     def _compute_KL_losses(self, series, prior):
         """辅助函数计算series_loss和prior_loss"""
@@ -174,19 +213,19 @@ class Solver(object):
         loss_2 = []
         for i, (input_data, _) in enumerate(vali_loader):
             input = input_data.float().to(self.device)
-            # series, prior = self.model(input)
-            series, prior,series_features, prior_features, self.series_centers,self.prior_centers,series_rec_mean = self.model(input)
+            series, prior = self.model(input)
+            # series, prior,series_features, prior_features, self.series_centers,self.prior_centers = self.model(input)
 
             series_loss, prior_loss = self._compute_KL_losses(series, prior)
 
 
-            series_mse_loss= self.compute_mse_loss(series_rec_mean, input)
-            series_mse_loss = torch.mean(series_mse_loss)
+            # series_mse_loss= self.compute_mse_loss(series_rec_mean, input)
+            # series_mse_loss = torch.mean(series_mse_loss)
 
-            center_loss = self.compute_center_loss(series_features, prior_features)
-            center_loss = torch.mean(center_loss)
+            # center_loss = self.compute_center_loss(series_features, prior_features)
+            # center_loss = torch.mean(center_loss)
 
-            loss = self.kl_loss*abs(prior_loss - series_loss)+center_loss+self.rec_loss*series_mse_loss
+            loss = self.kl_loss*(prior_loss -series_loss)
             loss_1.append(loss.item())
             # loss_1.append((prior_loss - series_loss).item())
         return np.average(loss_1), np.average(loss_2)
@@ -197,8 +236,6 @@ class Solver(object):
         if not os.path.exists(path):
             os.makedirs(path)
         early_stopping = EarlyStopping(patience=5, verbose=True, dataset_name=self.data_path)
-
-
         # # 定义两个可学习的权重参数
         # series_weight = nn.Parameter(torch.tensor(1.0, requires_grad=True))
         # prior_weight = nn.Parameter(torch.tensor(1.0, requires_grad=True))
@@ -214,19 +251,19 @@ class Solver(object):
                 self.optimizer.zero_grad()
                 iter_count += 1
                 input = input_data.float().to(self.device)
-                # series, prior = self.model(input)
-                # series_loss, prior_loss = self._compute_KL_losses(series, prior)
-                # loss = prior_loss - series_loss
-                series, prior,series_features, prior_features, self.series_centers,self.prior_centers,series_rec_mean= self.model(input)
+                series, prior = self.model(input)
                 series_loss, prior_loss = self._compute_KL_losses(series, prior)
+                loss = self.kl_loss*(prior_loss -series_loss)
+                # series, prior,series_features, prior_features, self.series_centers,self.prior_centers= self.model(input)
+                # series_loss, prior_loss = self._compute_KL_losses(series, prior)
 
-                series_mse_loss = self.compute_mse_loss(series_rec_mean, input)
-                series_mse_loss = torch.mean(series_mse_loss)
+                # series_mse_loss = self.compute_mse_loss(series_rec_mean, input)
+                # series_mse_loss = torch.mean(series_mse_loss)
 
-                center_loss = self.compute_center_loss(series_features, prior_features)
-                center_loss = torch.mean(center_loss)
+                # center_loss = self.compute_center_loss(series_features, prior_features)
+                # center_loss = torch.mean(center_loss)
 
-                loss = self.kl_loss*abs(prior_loss - series_loss)+center_loss+self.rec_loss*series_mse_loss
+                # loss = self.kl_loss*abs(prior_loss - series_loss)+self.center_weight*center_loss
                 if (i + 1) % 100 == 0:
                     # speed = (time.time() - time_now) / iter_count
                     # left_time = speed * ((self.num_epochs - epoch) * train_steps - i)
@@ -239,6 +276,11 @@ class Solver(object):
 
                 loss.backward()
                 self.optimizer.step()
+                # w1,w2,w3=self.adjust_ratio(self.kl_loss*self.patchnum_weight,self.kl_loss*self.patchsize_weight,
+                #                   self.rec_loss,series_loss,prior_loss,series_mse_loss)
+                # self.patchnum_weight = w1 / self.kl_loss
+                # self.patchsize_weight = w2 / self.kl_loss
+                # self.rec_loss = w3
 
             vali_loss1, vali_loss2 = self.vali(self.vali_loader)
 
@@ -255,7 +297,8 @@ class Solver(object):
         attens_energy = []
         for i, (input_data, labels) in enumerate(data_loader):
             input = input_data.float().to(self.device)
-            series, prior,series_features, prior_features,_,_,series_rec_mean = self.model(input)
+            # series, prior,series_features, prior_features,_,_ = self.model(input)
+            series, prior= self.model(input)
             series_loss = 0.0
             prior_loss = 0.0
             for u in range(len(prior)):
@@ -265,11 +308,11 @@ class Solver(object):
                                                                                                         self.win_size)
                 series_loss += my_kl_loss(series[u], n_normalized.detach()) * temperature
                 prior_loss += my_kl_loss(prior[u], p_normalized.detach()) * temperature
-            center_loss = self.compute_center_loss(series_features, prior_features)
-            series_mse_loss = self.compute_mse_loss(series_rec_mean, input)
+            # center_loss = self.compute_center_loss(series_features, prior_features)
+            # series_mse_loss = self.compute_mse_loss(series_rec_mean, input)
             # metric = torch.softmax((-series_loss - prior_loss), dim=-1)
             kl_loss = -self.patchnum_weight*series_loss - self.patchsize_weight*prior_loss
-            metric = torch.softmax((kl_loss-center_loss-self.rec_loss*series_mse_loss), dim=-1)
+            metric = torch.softmax((kl_loss), dim=-1)
             cri = metric.detach().cpu().numpy()
             attens_energy.append(cri)
         return np.concatenate(attens_energy, axis=0).reshape(-1)
@@ -280,7 +323,8 @@ class Solver(object):
         labels_list = []
         for i, (input_data, labels) in enumerate(data_loader):
             input = input_data.float().to(self.device)
-            series, prior,series_features, prior_features,_,_,series_rec_mean= self.model(input)
+            # series, prior,series_features, prior_features,_,_= self.model(input)
+            series, prior = self.model(input)
             series_loss = 0.0
             prior_loss = 0.0
             for u in range(len(prior)):
@@ -291,10 +335,10 @@ class Solver(object):
                 series_loss += my_kl_loss(series[u], n_normalized.detach()) * temperature
                 prior_loss += my_kl_loss(prior[u], p_normalized.detach()) * temperature
 
-            center_loss = self.compute_center_loss(series_features, prior_features)
-            series_mse_loss = self.compute_mse_loss(series_rec_mean, input)
+            # center_loss = self.compute_center_loss(series_features, prior_features)
+            # series_mse_loss = self.compute_mse_loss(series_rec_mean, input)
             kl_loss = -self.patchnum_weight*series_loss - self.patchsize_weight*prior_loss
-            metric = torch.softmax((kl_loss - center_loss - self.rec_loss * series_mse_loss), dim=-1)
+            metric = torch.softmax((kl_loss), dim=-1)
             # metric = torch.softmax((-series_loss - prior_loss), dim=-1)
             cri = metric.detach().cpu().numpy()
             attens_energy.append(cri)
@@ -307,15 +351,16 @@ class Solver(object):
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.eval()
         self.model.trainning=False
-        # 加载中心向量并移至设备
-        device = next(self.model.parameters()).device
-        for i, (s_center, p_center) in enumerate(zip(checkpoint['series_centers'], checkpoint['prior_centers'])):
-            self.model.series_centers[i] = nn.Parameter(s_center.to(device))
-            self.model.prior_centers[i] = nn.Parameter(p_center.to(device))
-        print(f"模型和中心向量已从 {model_path} 加载")
+        # # 加载中心向量并移至设备
+        # device = next(self.model.parameters()).device
+        # for i, (s_center, p_center) in enumerate(zip(checkpoint['series_centers'], checkpoint['prior_centers'])):
+        #     self.model.series_centers[i] = nn.Parameter(s_center.to(device))
+        #     self.model.prior_centers[i] = nn.Parameter(p_center.to(device))
+        # print(f"模型和中心向量已从 {model_path} 加载")
         temperature = 50
-        self.prior_centers = self.model.series_centers
-        self.series_centers = self.model.prior_centers
+        # self.prior_centers = self.model.series_centers
+        # self.series_centers = self.model.prior_centers
+
         # (1) stastic on the train set
         train_energy = self._compute_attens_energy(self.train_loader, temperature)
         # (2) find the threshold

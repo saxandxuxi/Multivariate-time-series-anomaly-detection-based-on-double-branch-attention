@@ -6,27 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from .Mahalanobis_mask import Mahalanobis_mask, PyramidMahalanobisMask, MultiDistanceChannelClustering
-from .TCM import Linear_extractor_cluster
+
 from .attn import DAC_structure, AttentionLayer
 from .compute_ppr import compute_ppr
 from .embed import DataEmbedding, TokenEmbedding
 from .RevIN import RevIN
-
-
-# def order_shuffle(x, size=None):
-#     """对通道维度进行随机混洗（通道维度在最后一维）"""
-#     if size is None:
-#         size = x.shape[-1]  # 通道维度在最后一维（B, L, M）
-#     shuffled_indices = torch.randperm(size, device=x.device)
-#     return x[..., shuffled_indices]  # 混洗最后一维（通道维度）
-
-def order_shuffle(tensor, size=2, dim=1):
-    """将指定维度的特征向量均分为两部分并交换顺序"""
-    target_size = tensor.shape[dim]
-    half_n = target_size // size
-    part1 = tensor.narrow(dim, half_n, target_size - half_n)  # 后半部分
-    part2 = tensor.narrow(dim, 0, half_n)                     # 前半部分
-    return torch.cat([part1, part2], dim=dim)  # 拼接：后半部分+前半部分
 
 
 class Encoder(nn.Module):
@@ -86,7 +70,7 @@ class DCdetector(nn.Module):
         self.encoder = Encoder(
             [
                 AttentionLayer(
-                    DAC_structure(win_size, patch_size, channel, True, attention_dropout=dropout,
+                    DAC_structure(win_size, patch_size, channel, False, attention_dropout=dropout,
                                   output_attention=output_attention),
                     d_model, patch_size, channel, n_heads, win_size) for l in range(e_layers)
             ],

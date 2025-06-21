@@ -6,13 +6,23 @@ import math
 from math import sqrt
 import os
 from einops import rearrange, reduce, repeat
-
 from model.DynamicReconHead import DynamicReconHead
-from model.GCN_representation import GCN
 
 
+#嵌入之后到这个模块进行变换
 class DAC_structure(nn.Module):
-    def __init__(self, win_size, patch_size, channel, mask_flag=True, scale=None, attention_dropout=0.05, output_attention=False,d_model = 256):
+    def __init__(self, win_size, patch_size, channel, mask_flag=True, scale=None, attention_dropout=0.05,
+                 output_attention=False):
+        """
+            win_size：窗口大小，代表输入序列的长度。
+            patch_size：补丁大小，用于将输入序列划分为多个补丁。
+            channel：通道数，可理解为特征的维度，就是有多少个传感器
+            mask_flag：布尔值，是否使用掩码，默认为 True。
+            scale：缩放因子，默认为 None。
+            attention_dropout：注意力机制中的丢弃率，默认为 0.05。
+            output_attention：布尔值，是否输出注意力分数，默认为 False。
+            self.dropout：创建一个 nn.Dropout 层，用于在注意力计算过程中随机丢弃部分元素，防止过拟合。
+        """
         super(DAC_structure, self).__init__()
         self.scale = scale
         self.mask_flag = mask_flag
@@ -21,57 +31,33 @@ class DAC_structure(nn.Module):
         self.window_size = win_size
         self.patch_size = patch_size
         self.channel = channel
-        self.d_model = d_model
-        self.patch_wise_recon_head = DynamicReconHead()
-        self.gcn = GCN(num_layers=1)
 
     def forward(self, queries_patch_size, queries_patch_num, keys_patch_size, keys_patch_num, values, patch_index,
-                attn_mask):
+                patch_size_mask=None,  # 新增！形状: (B, 1, L_patch_num, L_patch_num)
+                patch_num_mask=None):
+
         # Patch-wise Representation
-        B, N, PatchNum, D = queries_patch_size.shape  # bs, channel, patch_num, d_model
-
-        scale_patch_size = self.scale or 1. / torch.sqrt(torch.tensor(D, dtype=torch.float32))
-        scores_patch_size = torch.einsum("bnld,bnmd->bnlm", queries_patch_size,
-                                         keys_patch_size)  # bs, channel, patch_num, patch_num
-        # 应用通道掩码 (bs,1,channel,channel)
+        B, L, H, E = queries_patch_size.shape  # batch_size, patch_num, n_head, d_model/n_head
+        scale_patch_size = self.scale or 1. / sqrt(E)
+        scores_patch_size = torch.einsum("blhe,bshe->bhls", queries_patch_size,
+                                         keys_patch_size)  # batch, nheads, p_num, p_num
         if self.mask_flag:
-            # 扩展掩码维度为 [B, C, 1, PatchNum, PatchNum]
-            mask_expanded = attn_mask.squeeze(1).unsqueeze(2).unsqueeze(-1)  # [B, C, 1, C, 1]
-            # 重塑scores_patch_size以匹配掩码维度
-            scores_expanded = scores_patch_size.unsqueeze(3)  # [B, C, PatchNum, 1, PatchNum]
-            # 应用掩码（沿通道维度进行矩阵乘法）
-            scores_patch_size = (scores_expanded * mask_expanded).sum(dim=3)  # [B, C, PatchNum, PatchNum]
-
-
+            # scores_patch_size = scores_patch_size.masked_fill(patch_size_mask == 0, -torch.inf)
+            scores_patch_size = scores_patch_size * patch_size_mask
         attn_patch_size = scale_patch_size * scores_patch_size
-        attn_patch_size = self.gcn(attn_patch_size,attn_mask,out_ft = PatchNum )
-        series_patch_size = self.dropout(torch.softmax(attn_patch_size, dim=-1))  # bs, channel, patch_num, patch_num
+        series_patch_size = self.dropout(torch.softmax(attn_patch_size, dim=-1))  # B H N N
 
         # In-patch Representation
-        B, N, PatchSize, D = queries_patch_num.shape  # bs, channel, patch_size, d_model
-
-        scale_patch_num = self.scale or 1. / torch.sqrt(torch.tensor(D, dtype=torch.float32))
-        scores_patch_num = torch.einsum("bnld,bnmd->bnlm", queries_patch_num,
-                                        keys_patch_num)  # bs, channel, patch_size, patch_size
-        # 应用通道掩码
+        B, L, H, E = queries_patch_num.shape  # batch_size, patch_size, n_head, d_model/n_head
+        scale_patch_num = self.scale or 1. / sqrt(E)
+        scores_patch_num = torch.einsum("blhe,bshe->bhls", queries_patch_num,
+                                        keys_patch_num)  # batch, nheads, p_size, p_size
         if self.mask_flag:
-            mask_expanded = attn_mask.squeeze(1).unsqueeze(2).unsqueeze(-1)  # [B, C, 1, C, 1]
-            scores_expanded = scores_patch_num.unsqueeze(3)  # [B, C, PatchSize, 1, PatchSize]
-            scores_patch_num = (scores_expanded * mask_expanded).sum(dim=3)  # [B, C, PatchSize, PatchSize]
-
+            # 掩码形状 (B,1,L,L) → 广播到 (B,H,L,L)
+            # scores_patch_num = scores_patch_num.masked_fill(patch_num_mask == 0, -torch.inf)
+            scores_patch_num = scores_patch_num * patch_num_mask
         attn_patch_num = scale_patch_num * scores_patch_num
-        attn_patch_num = self.gcn(attn_patch_num,attn_mask,out_ft=PatchSize)
-        series_patch_num = self.dropout(torch.softmax(attn_patch_num, dim=-1))  # bs, channel, patch_size, patch_size
-
-        # 补丁间重建（保留通道维度）
-        bs, ch, pn, _ = series_patch_size.shape
-        patch_wise_flat = series_patch_size.reshape(bs, ch, -1)  # (bs, channel, patch_num*patch_num)
-        patch_wise_recon = self.patch_wise_recon_head(patch_wise_flat, self.window_size)  # (bs, channel, pn)
-        patch_wise_recon = patch_wise_recon.permute(0, 2, 1)
-
-        # 通道间平均
-        series_patch_size = series_patch_size.mean(dim=1, keepdim=True)  # bs, 1, patch_num, patch_num
-        series_patch_num = series_patch_num.mean(dim=1, keepdim=True)  # bs, 1, patch_size, patch_size
+        series_patch_num = self.dropout(torch.softmax(attn_patch_num, dim=-1))  # B H S S
 
         # 上采样到window_size
         target_size = self.window_size
@@ -80,61 +66,71 @@ class DAC_structure(nn.Module):
         series_patch_num = F.interpolate(series_patch_num, size=(target_size, target_size), mode='bilinear',
                                          align_corners=False)
 
+        # 通道间平均
+        # series_patch_size = series_patch_size.mean(dim=1, keepdim=True)  # bs, 1, patch_num, patch_num
+        # series_patch_num = series_patch_num.mean(dim=1, keepdim=True)  # bs, 1, patch_size, patch_size
+
         if self.output_attention:
-            return series_patch_size, series_patch_num,patch_wise_recon
+            return series_patch_size, series_patch_num
         else:
-            return None
-
-
+            return (None)
 
 
 class AttentionLayer(nn.Module):
     def __init__(self, attention, d_model, patch_size, channel, n_heads, win_size, d_keys=None, d_values=None):
+        """
+            attention：一个注意力机制的实例，用于后续的注意力计算。
+            d_model：模型的嵌入维度，即输入特征的维度。
+            patch_size：补丁的大小，用于将输入序列划分为多个补丁。
+            channel：通道数，可理解为特征的维度数量。
+            n_heads：多头注意力的头数。
+            win_size：窗口大小，代表输入序列的长度。
+            d_keys 和 d_values：分别是键（keys）和值（values）的维度，默认为 None。
+        """
+        # 首先调用父类nn.Module的初始化方法
         super(AttentionLayer, self).__init__()
-
         d_keys = d_keys or (d_model // n_heads)
         d_values = d_values or (d_model // n_heads)
-        self.norm = nn.LayerNorm(d_model)
         self.inner_attention = attention
         self.patch_size = patch_size
         self.channel = channel
         self.window_size = win_size
-        self.n_heads = n_heads 
-        
+        self.n_heads = n_heads
+
         self.patch_query_projection = nn.Linear(d_model, d_keys * n_heads)
         self.patch_key_projection = nn.Linear(d_model, d_keys * n_heads)
-        self.out_projection = nn.Linear(d_values * n_heads, d_model)      
-        self.value_projection = nn.Linear(d_model, d_values * n_heads)
+        self.out_projection = nn.Linear(d_values * n_heads, d_model)
+        # self.fourier_query_enhanced1 = FourierBlock(d_model,d_model,H=n_heads)#查询增强
+        # self.fourier_key_enhanced2 = FourierBlock(d_model,d_model,H=n_heads)#键增强
+        # self.value_projection = nn.Linear(d_model, d_values * n_heads)
 
-    def forward(self, x_patch_size, x_patch_num, x_ori, patch_index, attn_mask):
-        
+    def forward(self, x_patch_size, x_patch_num, patch_index,
+                patch_size_mask=None,  # 新增！形状: (B, 1, L_patch_num, L_patch_num)
+                patch_num_mask=None):
         # patch_size
-        B, L, M = x_patch_size.shape##Batch*channel n d_model
-        BS = B // self.channel  # 恢复真实batch_size
-        N = self.channel  # 通道数
+        B, L, M = x_patch_size.shape
         H = self.n_heads
         queries_patch_size, keys_patch_size = x_patch_size, x_patch_size
-        queries_patch_size = self.patch_query_projection(queries_patch_size).view(BS, N, L, -1)#(64,22,70,256)
-        keys_patch_size = self.patch_key_projection(keys_patch_size).view(BS, N, L, -1)
-
+        queries_patch_size = self.patch_query_projection(queries_patch_size).view(B, L, H, -1)
+        keys_patch_size = self.patch_key_projection(keys_patch_size).view(B, L, H, -1)  # (B,L,H,D_model)
+        # queries_patch_size = self.fourier_query_enhanced1(queries_patch_size,channel=self.channel)
+        # keys_patch_size = self.fourier_key_enhanced2(keys_patch_size,channel=self.channel)
         # patch_num
-        B, L, M = x_patch_num.shape#Batch*channel p d_model
+        B, L, M = x_patch_num.shape
         queries_patch_num, keys_patch_num = x_patch_num, x_patch_num
-        queries_patch_num = self.patch_query_projection(queries_patch_num).view(BS, N, L, -1)
-        keys_patch_num = self.patch_key_projection(keys_patch_num).view(BS, N, L, -1)
-        
-        # x_ori
-        B, L, d_model = x_ori.shape#(1408,70,256)
-        values = self.value_projection(x_ori).view(BS, N, L, -1)
-        
-        series, prior,patch_wise_recon = self.inner_attention(
+        queries_patch_num = self.patch_query_projection(queries_patch_num).view(B, L, H, -1)
+        keys_patch_num = self.patch_key_projection(keys_patch_num).view(B, L, H, -1)
+        # queries_patch_num = self.fourier_query_enhanced1(queries_patch_num,channel=self.channel)
+        # keys_patch_num = self.fourier_key_enhanced2(keys_patch_num,channel=self.channel)
+
+        series, prior = self.inner_attention(
             queries_patch_size, queries_patch_num,
             keys_patch_size, keys_patch_num,
-            values, patch_index,
-            attn_mask
+            None, patch_index,
+            patch_size_mask=patch_size_mask, patch_num_mask=patch_num_mask
         )
-        
-        return series, prior,patch_wise_recon
+
+        return series, prior
 
   # # 处理series_patch_size
   #       batch_times_heads, heads, n, n = series_patch_size.shape

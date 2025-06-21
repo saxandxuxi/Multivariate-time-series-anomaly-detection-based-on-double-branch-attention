@@ -109,10 +109,11 @@ if __name__ == '__main__':
                         help='Enable testing mode (default: True). Use --no-istest to disable.')
     parser.add_argument('--anormly_ratio', type=float, default=4.00)
     parser.add_argument('--patchnum_weight', type=float, default=0.15)
-    parser.add_argument('--patchsize_weight', type=float, default=1.0)
+    parser.add_argument('--patchsize_weight', type=float, default=0.0)
     parser.add_argument('--sigma', type=float, default=5.0)
-    parser.add_argument('--rec_loss', type=float, default=0.1)
-    parser.add_argument('--kl_loss', type=float, default=0.1)
+    parser.add_argument('--rec_loss', type=float, default=0.0)
+    parser.add_argument('--kl_loss', type=float, default=0.0)
+    parser.add_argument('--center_weight', type=float, default=0.0)
     config = parser.parse_args()
     args = vars(config)
     config.patch_size = [int(patch_index) for patch_index in config.patch_size]
@@ -143,7 +144,7 @@ if __name__ == '__main__':
         config.patch_size = [1,3]
         config.win_size = 54
 
-    if config.dataset == 'EV47':
+    if config.dataset == 'EV47':#适合小一点的补丁
         config.anormly_ratio = 1
         config.num_epochs = 1
         config.batch_size = 64# 根据内存来该改
@@ -151,25 +152,26 @@ if __name__ == '__main__':
         config.data_path = config.dataset
         config.input_c = 22
         config.output_c = 22
-        config.e_layers = 3
+        config.e_layers = 4
         config.d_model = 256
         config.loss_fuc = 'MSE'
-        config.patch_size = [1,3]
-        config.win_size = 36  # 是3,5,7的最小公倍数[70]
+        config.patch_size = [3]
+        config.win_size = 36 # 是3,5,7的最小公倍数[70]
         config.istest = True
-        config.patchnum_weight = 0.02 # 0.03,1
+        config.patchnum_weight = 1.0 # 0.03,1
         config.patchsize_weight = 1.0
         config.dropout = 0.01
         config.lr = 1e-4
         config.sigma = 3.0
-        config.rec_loss = 1.0
-        config.kl_loss = 1#0.02
+        config.rec_loss = 0.0
+        config.kl_loss = 1.0#0.02
+        config.center_weight = 0.0
         set_seed(18)
 
-    if config.dataset == 'EV24':
+    if config.dataset == 'EV24':#适合大一点点的
         config.anormly_ratio = 1.8
         config.num_epochs = 1
-        config.batch_size = 64# 根据内存来该改
+        config.batch_size = 32# 根据内存来该改
         config.mode = 'train'
         config.data_path = config.dataset
         config.input_c = 22
@@ -178,19 +180,18 @@ if __name__ == '__main__':
         config.n_heads = 1
         config.d_model = 256
         config.loss_fuc = 'MSE'
-        config.patch_size = [1,5,7]#[5,7]
+        config.patch_size = [3,5,7]#[5,7]
         config.win_size = 105# 是3,5,7的最小公倍数[70]
         config.istest = True
-        config.patchnum_weight = 0.02#0.03
+        config.patchnum_weight = 1#0.03
         config.patchsize_weight = 1
-        config.dropout = 0.02
+        config.dropout = 0.0
         config.lr = 1e-4
-        config.sigma = 5.0
-        config.rec_loss = 0.8
-        config.kl_loss = 1
+        config.sigma = 3.0
+        config.kl_loss = 1.0
         set_seed(18)
 
-    if config.dataset == 'VLoong':
+    if config.dataset == 'VLoong':#适合大的
         config.anormly_ratio = 1
         config.num_epochs = 1
         config.batch_size = 64  # 根据内存来该改
@@ -201,7 +202,13 @@ if __name__ == '__main__':
         config.loss_fuc = 'MSE'
         config.patch_size = [3,5,7]
         config.win_size = 105
-        config.patchnum_weight = 0.15
+        config.patchnum_weight = 1
+        config.patchsize_weight = 1
+        config.dropout = 0.0
+        config.lr = 1e-4
+        config.sigma = 3.0
+        config.kl_loss = 1.0
+        set_seed(18)
 
     config.use_gpu = True if torch.cuda.is_available() and config.use_gpu else False
     if config.use_gpu and config.use_multi_gpu:

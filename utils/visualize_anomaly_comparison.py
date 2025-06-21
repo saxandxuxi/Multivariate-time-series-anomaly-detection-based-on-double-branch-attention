@@ -6,6 +6,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 # 在 model/DCdetector.py 中
 from compute_thre import *
+from metrics.metrics import combine_all_evaluation_scores
 
 
 def save_energy_metrics(
@@ -74,7 +75,7 @@ def plot_energy_distribution(save_path: str) -> None:
     # 加载数据
     data = np.load(save_path)
     combined_energy = data["combined_energy"]
-    sigma = 4.0
+    sigma =6.0
     thresh = set_global_threshold(combined_energy, sigma=sigma)
     # thresh = np.percentile(combined_energy, 100 - 3)
     # thresh = histogram_threshold(combined_energy, bins=40)
@@ -108,6 +109,11 @@ def plot_energy_distribution(save_path: str) -> None:
 
     pred = np.array(pred)
     gt = np.array(gt)
+    matrix = []
+    scores_simple = combine_all_evaluation_scores(pred, gt, test_energy)
+    for key, value in scores_simple.items():
+        matrix.append(value)
+        print('{0:21} : {1:0.4f}'.format(key, value))
 
     accuracy = accuracy_score(gt, pred)
     precision, recall, f_score, support = precision_recall_fscore_support(gt, pred, average='binary')
@@ -199,7 +205,6 @@ def plot_energy_distribution(save_path: str) -> None:
     plot_path = os.path.join(plot_dir, "energy_distribution_with_predictions.png")
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.show()
-
 
 def plot_time_series_anomaly(save_path: str) -> None:
     """
@@ -300,7 +305,7 @@ def plot_time_series_anomaly(save_path: str) -> None:
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.show()
 if __name__ == "__main__":
-    plot_energy_distribution(save_path='../result/EV47_energy_metrics_sigma3.00.npz')
-    plot_time_series_anomaly(save_path='../result/EV47_energy_metrics_sigma3.00.npz')
+    plot_energy_distribution(save_path='../result/EV24_energy_metrics_sigma3.00.npz')
+    plot_time_series_anomaly(save_path='../result/EV24_energy_metrics_sigma3.00.npz')
 
 
